@@ -1,3 +1,4 @@
+import argparse
 import base64
 import getpass
 import json
@@ -271,6 +272,22 @@ def ensure_output_dir(output_dir: str) -> Path:
 
 def main():
     """Main CLI entry point."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Download OpenReview papers and reviews"
+    )
+    parser.add_argument(
+        "--wipe-credentials",
+        action="store_true",
+        help="Delete cached credentials and exit",
+    )
+    args = parser.parse_args()
+
+    # Handle credential wipe command
+    if args.wipe_credentials:
+        delete_credentials()
+        return 0
+
     # Ask for the URL
     url = input("Enter the OpenReview URL: ")
 
