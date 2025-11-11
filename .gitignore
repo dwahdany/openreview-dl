@@ -1,2 +1,3 @@
 output/
 credentials.enc
+__pycache__/

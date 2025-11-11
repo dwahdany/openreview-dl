@@ -1,45 +1,68 @@
-# OpenReview Review Fetcher
+# openreview-dl
 
-This script fetches paper details, reviews, and rebuttals from OpenReview and converts them to formatted ODT and Markdown documents.
+Download OpenReview paper reviews and rebuttals as formatted documents (ODT and Markdown).
 
 ## Features
 
 - Extracts forum ID and venue ID from an OpenReview URL
-- Optional credential caching
+- Optional credential caching (machine-specific encryption)
 - Fetches paper details, reviews, and rebuttals
 - Generates a formatted markdown document
-- Converts the markdown to an ODT file
+- Converts the markdown to an ODT file for easy reading
+- Organizes reviews by reviewer with threaded replies
 
-## Requirements
+## Installation
 
-- Python (tested with 3.11)
-- Dependencies, see conda environment file (`env.yml`)
+### Using uvx (recommended - no installation needed)
 
-## Setup
-
-### Option 1: Using conda
-1. Create the conda environment:
-```
-conda env create -f env.yml
+```bash
+uvx openreview-dl
 ```
 
-2. Activate the environment:
-```
-conda activate openreview
+### Using uv
+
+```bash
+uv tool install openreview-dl
 ```
 
-### Option 2: Using uv (faster)
-1. Install uv if you haven't already:
+### Using pip
 
-2. Run it with uv `uv run get_reviews.py`
+```bash
+pip install openreview-dl
+```
 
 ## Usage
 
-1. Run the script: `python get_reviews.py`
-2. Enter the full OpenReview URL when prompted (like `https://openreview.net/forum?id=XXXXXXXXXXXX&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DConference.org%2FYYYY%2FMeeting%2FAuthors%23your-submissions)`)
-3. Provide your OpenReview username and password
-4. The script will generate an `$FORUM_ID.odt` and `$FORUM_ID.md` file in the same directory, where `$FORUM_ID` is the ID of the forum extracted from step 2.
+Run the command and follow the prompts:
+
+```bash
+openreview-dl
+```
+
+Or with uvx:
+
+```bash
+uvx openreview-dl
+```
+
+You'll be prompted to:
+1. Enter the full OpenReview URL (example: `https://openreview.net/forum?id=XXXXXXXXXXXX&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DConference.org%2FYYYY%2FMeeting%2FAuthors%23your-submissions)`)
+2. Provide your OpenReview username and password
+3. Optionally cache credentials for future use (stored in `~/.config/openreview-dl/credentials.enc` with machine-specific encryption)
+
+The tool will generate:
+- `output/$FORUM_ID.md` - Markdown formatted file
+- `output/$FORUM_ID.odt` - ODT document (can be opened in LibreOffice, Microsoft Word, etc.)
+
+where `$FORUM_ID` is the paper ID extracted from the URL.
+
+## Credential Caching
+
+If you choose to cache credentials, they are stored at:
+- **Linux/macOS**: `~/.config/openreview-dl/credentials.enc`
+
+The credentials are encrypted using machine-specific keys (hostname-based), so they won't work if copied to another machine. However, this is not fully secure - anyone with access to your user account can potentially decrypt them.
 
 ## Note
 
-Ensure you have the necessary permissions to access the paper on OpenReview.
+Ensure you have the necessary permissions to access the paper on OpenReview. You must be logged in with an account that has access to the reviews (typically as an author, reviewer, or area chair).
