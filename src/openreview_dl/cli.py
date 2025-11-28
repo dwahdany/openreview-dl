@@ -17,11 +17,20 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-try:
-    pypandoc.get_pandoc_version()
-except OSError:
-    print("Pandoc not found. Downloading...")
-    pypandoc.download_pandoc()
+_pandoc_checked = False
+
+
+def _ensure_pandoc():
+    """Ensure pandoc is available, downloading if necessary."""
+    global _pandoc_checked
+    if _pandoc_checked:
+        return
+    try:
+        pypandoc.get_pandoc_version()
+    except OSError:
+        print("Pandoc not found. Downloading...")
+        pypandoc.download_pandoc()
+    _pandoc_checked = True
 
 
 def get_config_dir() -> Path:
@@ -256,6 +265,7 @@ def process_note(note, is_rebuttal=False):
 
 
 def markdown_to_odt(markdown_text, output_filename):
+    _ensure_pandoc()
     # Convert markdown to HTML
     html = markdown.markdown(markdown_text)
 
