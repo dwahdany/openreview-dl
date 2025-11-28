@@ -3,6 +3,7 @@ import base64
 import getpass
 import json
 import os
+import platform
 import re
 import urllib.parse
 from operator import itemgetter
@@ -39,7 +40,7 @@ def get_key():
     # Use a fixed salt (not ideal, but better than nothing)
     salt = b"fixed_salt_for_openreview"
     # Use the machine's hostname as a basis for the key
-    hostname = os.uname().nodename.encode()
+    hostname = platform.uname().node.encode()
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
