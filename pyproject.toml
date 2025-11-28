@@ -35,6 +35,11 @@ Homepage = "https://github.com/dwahdany/openreview-dl"
 Repository = "https://github.com/dwahdany/openreview-dl"
 Issues = "https://github.com/dwahdany/openreview-dl/issues"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
