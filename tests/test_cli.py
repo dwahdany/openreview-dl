@@ -311,6 +311,26 @@ PROFILE = {
 }
 
 
+def _jwt(exp=None, user_id="~Test_User1", profile_id="~Test_User1") -> str:
+    """A syntactically valid, unsigned JWT like the ones OpenReview issues."""
+    import base64
+
+    def part(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    user = {"id": user_id}
+    if profile_id is not None:
+        user["profile"] = {"id": profile_id}
+    payload = {"user": user}
+    if exp is not None:
+        payload["exp"] = exp
+    return f"{part({'alg': 'HS256', 'typ': 'JWT'})}.{part(payload)}.signature"
+
+
+FUTURE = int(time.time()) + 3 * 24 * 3600
+PAST = int(time.time()) - 60
+
+
 class _FakeResponse:
     def __init__(self, status_code, payload=None, raise_on_json=False):
         self.status_code = status_code
@@ -329,8 +349,8 @@ class _FakeSession:
         self.error = error
         self.calls = []
 
-    def get(self, url, headers=None, timeout=None):
-        self.calls.append({"url": url, "headers": headers, "timeout": timeout})
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
         if self.error:
             raise self.error
         return self.response
@@ -347,27 +367,44 @@ class _FakeClient:
 class TestTokenOwner:
     """Tests for token_owner - asks OpenReview who a token belongs to."""
 
-    def test_returns_profile_for_valid_token(self):
+    def test_fetches_the_profile_named_in_the_token(self):
         client = _FakeClient()
-        assert cli.token_owner(client, "tok") == (PROFILE, None, True)
+        assert cli.token_owner(client, _jwt(exp=FUTURE)) == (PROFILE, None, True)
         call = client.session.calls[0]
         assert call["url"] == "https://api2.example.org/profiles"
-        assert call["headers"]["Authorization"] == "Bearer tok"
+        assert call["params"] == {"id": "~Test_User1"}
+        assert call["headers"]["Authorization"] == f"Bearer {_jwt(exp=FUTURE)}"
         assert call["headers"]["User-Agent"] == "test"
         assert call["timeout"]
 
+    def test_email_login_id_is_looked_up_by_email(self):
+        client = _FakeClient()
+        token = _jwt(user_id="Me@Example.org", profile_id=None)
+        assert cli.token_owner(client, token) == (PROFILE, None, True)
+        assert client.session.calls[0]["params"] == {"email": "me@example.org"}
+
+    @pytest.mark.parametrize("token", ["tok", "", "a.b.c", _jwt(user_id="", profile_id=None)])
+    def test_non_token_is_rejected_without_a_request(self, token):
+        client = _FakeClient()
+        assert cli.token_owner(client, token) == (None, "it is not an OpenReview session token", True)
+        assert client.session.calls == []
+
     def test_401_is_a_definitive_rejection(self):
         client = _FakeClient(_FakeSession(_FakeResponse(401, {"message": "nope"})))
-        assert cli.token_owner(client, "tok") == (None, "OpenReview rejected it (HTTP 401)", True)
+        assert cli.token_owner(client, _jwt()) == (None, "OpenReview rejected it (HTTP 401)", True)
+
+    def test_404_is_a_definitive_rejection(self):
+        client = _FakeClient(_FakeSession(_FakeResponse(404, {"message": "nope"})))
+        assert cli.token_owner(client, _jwt()) == (None, "OpenReview knows no such profile", True)
 
     @pytest.mark.parametrize("status", [403, 429, 500, 503])
     def test_other_statuses_are_not_definitive(self, status):
         client = _FakeClient(_FakeSession(_FakeResponse(status, {"name": "ChallengeRequiredError"})))
-        assert cli.token_owner(client, "tok") == (None, f"OpenReview answered HTTP {status}", False)
+        assert cli.token_owner(client, _jwt()) == (None, f"OpenReview answered HTTP {status}", False)
 
     def test_network_error_is_not_blamed_on_the_token(self):
         client = _FakeClient(_FakeSession(error=ConnectionError("down")))
-        assert cli.token_owner(client, "tok") == (
+        assert cli.token_owner(client, _jwt()) == (
             None,
             "could not reach OpenReview to verify it (ConnectionError: down)",
             False,
@@ -375,7 +412,7 @@ class TestTokenOwner:
 
     def test_non_json_body_is_not_definitive(self):
         client = _FakeClient(_FakeSession(_FakeResponse(200, raise_on_json=True)))
-        assert cli.token_owner(client, "tok") == (None, "OpenReview sent an unreadable reply", False)
+        assert cli.token_owner(client, _jwt()) == (None, "OpenReview sent an unreadable reply", False)
 
     @pytest.mark.parametrize(
         "payload",
@@ -390,11 +427,11 @@ class TestTokenOwner:
     )
     def test_missing_or_malformed_profile_is_definitive(self, payload):
         client = _FakeClient(_FakeSession(_FakeResponse(200, payload)))
-        assert cli.token_owner(client, "tok") == (None, "OpenReview returned no profile for it", True)
+        assert cli.token_owner(client, _jwt()) == (None, "OpenReview returned no profile", True)
 
     def test_list_body_is_unreadable(self):
         client = _FakeClient(_FakeSession(_FakeResponse(200, [PROFILE])))
-        assert cli.token_owner(client, "tok") == (None, "OpenReview sent an unreadable reply", False)
+        assert cli.token_owner(client, _jwt()) == (None, "OpenReview sent an unreadable reply", False)
 
 
 class TestProfileMatchesUsername:
@@ -414,6 +451,43 @@ class TestProfileMatchesUsername:
     def test_profile_without_content(self):
         assert cli._profile_matches_username({"id": "~X1"}, "~X1") is True
         assert cli._profile_matches_username({"id": "~X1"}, "x@example.org") is False
+
+
+class TestTokenMatchesUsername:
+    """Tests for _token_matches_username - content match first, email lookup second."""
+
+    HIDDEN = {"id": "~Test_User1", "content": {"names": [{"username": "~Test_User1"}]}}
+
+    def test_content_match_needs_no_request(self):
+        client = _FakeClient()
+        assert cli._token_matches_username(client, "tok", PROFILE, "alt@example.org") is True
+        assert client.session.calls == []
+
+    def test_no_username_matches(self):
+        client = _FakeClient()
+        assert cli._token_matches_username(client, "tok", self.HIDDEN, None) is True
+        assert client.session.calls == []
+
+    def test_tilde_mismatch_needs_no_request(self):
+        client = _FakeClient()
+        assert cli._token_matches_username(client, "tok", self.HIDDEN, "~Other1") is False
+        assert client.session.calls == []
+
+    def test_hidden_email_is_resolved_through_openreview(self):
+        client = _FakeClient()  # the lookup answers with PROFILE (~Test_User1)
+        assert cli._token_matches_username(client, "tok", self.HIDDEN, "Test@Example.org") is True
+        call = client.session.calls[0]
+        assert call["params"] == {"email": "test@example.org"}
+        assert call["headers"]["Authorization"] == "Bearer tok"
+
+    def test_email_owned_by_someone_else_is_rejected(self):
+        other = {"id": "~Attacker1", "content": {}}
+        client = _FakeClient()  # the lookup says test@example.org belongs to ~Test_User1
+        assert cli._token_matches_username(client, "tok", other, "test@example.org") is False
+
+    def test_lookup_failure_rejects(self):
+        client = _FakeClient(_FakeSession(error=ConnectionError("down")))
+        assert cli._token_matches_username(client, "tok", self.HIDDEN, "test@example.org") is False
 
 
 class TestCallbackUser:
@@ -908,22 +982,6 @@ class TestMainPasskeyArguments:
         assert "{'name'" not in out
 
 
-def _jwt(exp=None, user_id="~Test_User1") -> str:
-    """A syntactically valid, unsigned JWT like the ones OpenReview issues."""
-    import base64
-
-    def part(obj):
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
-
-    payload = {"user": {"id": user_id, "profile": {"id": user_id}}}
-    if exp is not None:
-        payload["exp"] = exp
-    return f"{part({'alg': 'HS256', 'typ': 'JWT'})}.{part(payload)}.signature"
-
-
-FUTURE = int(time.time()) + 3 * 24 * 3600
-PAST = int(time.time()) - 60
-
 
 class TestTokenHelpers:
     """Tests for normalize_token, token_expiry, token_is_expired, describe_expiry."""
@@ -958,6 +1016,12 @@ class TestTokenHelpers:
     def test_is_expired(self):
         assert cli.token_is_expired(_jwt(exp=PAST)) is True
         assert cli.token_is_expired(_jwt(exp=FUTURE)) is False
+
+    def test_owner_id_prefers_profile_id(self):
+        assert cli._jwt_owner_id(_jwt(user_id="me@example.org", profile_id="~Me1")) == "~Me1"
+        assert cli._jwt_owner_id(_jwt(user_id="me@example.org", profile_id=None)) == "me@example.org"
+        assert cli._jwt_owner_id("not.a.jwt") is None
+        assert cli._jwt_owner_id(_jwt(user_id="", profile_id=None)) is None
 
     def test_describe_expiry_mentions_the_date(self):
         from datetime import datetime

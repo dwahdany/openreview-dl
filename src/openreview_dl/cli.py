@@ -159,15 +159,32 @@ def normalize_token(text: str) -> str:
     return token.strip("\"'")
 
 
-def token_expiry(token: str):
-    """Expiry of a JWT from its ``exp`` claim as a UTC datetime, or None if unknown."""
+def _jwt_payload(token: str):
+    """Decode a JWT's payload without verifying it; None if it is not a JWT."""
     try:
         payload = token.split(".")[1]
-        payload = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
-        exp = json.loads(payload).get("exp")
-        return datetime.fromtimestamp(float(exp), tz=timezone.utc) if exp else None
+        payload = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     except (IndexError, ValueError, TypeError, AttributeError):
         return None
+    return payload if isinstance(payload, dict) else None
+
+
+def token_expiry(token: str):
+    """Expiry of a JWT from its ``exp`` claim as a UTC datetime, or None if unknown."""
+    exp = (_jwt_payload(token) or {}).get("exp")
+    try:
+        return datetime.fromtimestamp(float(exp), tz=timezone.utc) if exp else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _jwt_owner_id(token: str):
+    """The profile id (or login id) an OpenReview session token was issued to."""
+    payload = _jwt_payload(token) or {}
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else payload
+    profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    owner = profile.get("id") or user.get("id")
+    return owner if isinstance(owner, str) and owner else None
 
 
 def token_is_expired(token: str, now=None) -> bool:
@@ -330,18 +347,12 @@ def build_passkey_url(baseurl: str, mfa_pending_token: str, port: int) -> str:
     )
 
 
-def token_owner(client, token: str):
-    """Ask OpenReview whose session ``token`` is.
-
-    Returns ``(profile, None, True)`` on success, otherwise ``(None, reason,
-    definitive)``: ``definitive`` is True only when OpenReview itself turned the
-    token down, not when the check could not be completed. ``GET /profiles``
-    with a bearer token returns the owner's profile (the same call
-    openreview-py's ``get_profile()`` makes).
-    """
+def _get_profile(client, token: str, **params):
+    """``GET /profiles`` with ``token`` as bearer; ``(profile, None, True)`` or ``(None, reason, definitive)``."""
     try:
         response = client.session.get(
             f"{client.baseurl.rstrip('/')}/profiles",
+            params=params,
             headers={**client.headers, "Authorization": f"Bearer {token}"},
             timeout=30,
         )
@@ -349,6 +360,8 @@ def token_owner(client, token: str):
         return None, f"could not reach OpenReview to verify it ({type(e).__name__}: {e})", False
     if response.status_code == 401:
         return None, "OpenReview rejected it (HTTP 401)", True
+    if response.status_code == 404:
+        return None, "OpenReview knows no such profile", True
     if response.status_code != 200:
         return None, f"OpenReview answered HTTP {response.status_code}", False
     try:
@@ -357,7 +370,26 @@ def token_owner(client, token: str):
         return None, "OpenReview sent an unreadable reply", False
     if profiles and isinstance(profiles[0], dict) and profiles[0].get("id"):
         return profiles[0], None, True
-    return None, "OpenReview returned no profile for it", True
+    return None, "OpenReview returned no profile", True
+
+
+def token_owner(client, token: str):
+    """Ask OpenReview whose session ``token`` is.
+
+    An OpenReview token is a JWT naming the account it was issued to. Fetching
+    that profile with the token as bearer (what openreview-py's constructor
+    does for ``token=``) both validates the token, since the server checks the
+    signature over the whole token and so over that claim, and returns the
+    owner's profile. Returns ``(profile, None, True)`` on success, otherwise
+    ``(None, reason, definitive)``: ``definitive`` is True only when OpenReview
+    itself turned the token down, not when the check could not be completed.
+    """
+    owner_id = _jwt_owner_id(token)
+    if not owner_id:
+        return None, "it is not an OpenReview session token", True
+    if owner_id.startswith("~"):
+        return _get_profile(client, token, id=owner_id)
+    return _get_profile(client, token, email=owner_id.lower())
 
 
 def _profile_matches_username(profile: dict, username) -> bool:
@@ -375,6 +407,21 @@ def _profile_matches_username(profile: dict, username) -> bool:
         if isinstance(name, dict)
     ]
     return wanted in {str(c).strip().lower() for c in candidates if c}
+
+
+def _token_matches_username(client, token: str, profile: dict, username) -> bool:
+    """True if ``username`` (the email or ~id used to log in) is ``profile``'s account.
+
+    Falls back to asking OpenReview which profile owns an email address, since a
+    profile's emails may not be listed in the fetched content.
+    """
+    if not username or _profile_matches_username(profile, username):
+        return True
+    wanted = username.strip().lower()
+    if wanted.startswith("~") or "@" not in wanted:
+        return False
+    other, _, _ = _get_profile(client, token, email=wanted)
+    return bool(other) and str(other.get("id")).lower() == str(profile.get("id")).lower()
 
 
 def _callback_user(raw_user, profile: dict) -> dict:
@@ -421,7 +468,7 @@ class _PasskeyCallbackHandler(http.server.BaseHTTPRequestHandler):
         if profile is None:
             self._reject(f"Ignoring a passkey callback: {reason}.")
             return
-        if not _profile_matches_username(profile, server.username):
+        if not _token_matches_username(server.client, token, profile, server.username):
             self._reject(
                 f"Ignoring a passkey callback for {profile.get('id')}: "
                 f"logging in as {server.username}."
