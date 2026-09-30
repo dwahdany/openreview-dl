@@ -20,11 +20,12 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+    # cryptography >= 49 ships no x86_64 macOS wheels; keep the floor below that.
     "cryptography>=44.0.2",
-    "markdown>=3.7",
+    "markdown>=3.8.1",
     "openreview-py>=2.0.0",
     "pypandoc>=1.15",
-    "urllib3>=2.0.0",
+    "urllib3>=2.7.0",
 ]
 
 [project.scripts]

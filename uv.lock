@@ -320,10 +320,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=44.0.2" },
-    { name = "markdown", specifier = ">=3.7" },
+    { name = "markdown", specifier = ">=3.8.1" },
     { name = "openreview-py", specifier = ">=2.0.0" },
     { name = "pypandoc", specifier = ">=1.15" },
-    { name = "urllib3", specifier = ">=2.0.0" },
+    { name = "urllib3", specifier = ">=2.7.0" },
 ]
 
 [package.metadata.requires-dev]
