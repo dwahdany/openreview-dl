@@ -516,6 +516,23 @@ class TestPasskeyCallbackDefaults:
     def test_port_reuse_is_disabled_on_windows(self):
         assert cli._PasskeyCallbackServer.allow_reuse_address == (sys.platform != "win32")
 
+    def test_server_listens_without_reverse_dns_lookup(self, monkeypatch):
+        """HTTPServer.server_bind() resolves the bound address between bind()
+        and listen(); on macOS that lookup can stall for ~30 s, leaving the
+        callback port unreachable meanwhile."""
+
+        def no_lookup(name=""):
+            raise AssertionError(f"reverse DNS lookup of {name!r} while starting the server")
+
+        monkeypatch.setattr(socket, "getfqdn", no_lookup)
+        server = cli._PasskeyCallbackServer(0, _FakeClient())
+        try:
+            port = server.server_address[1]
+            assert _is_listening(port)
+            assert (server.server_name, server.server_port) == ("127.0.0.1", port)
+        finally:
+            server.server_close()
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import socket
+import socketserver
 import sys
 import time
 import urllib.parse
@@ -514,6 +515,18 @@ class _PasskeyCallbackServer(http.server.HTTPServer):
         self.client = client
         self.username = username
         self.result = {}
+
+    def server_bind(self):
+        # HTTPServer.server_bind() reverse-resolves the bound address with
+        # socket.getfqdn() between bind() and listen(). Resolving 127.0.0.1 can
+        # stall for ~30 s on macOS (seen with python.org builds on GitHub's
+        # runners), during which the port refuses connections and the login
+        # URL has not been printed yet. Only CGI handlers read server_name, so
+        # record the address without a lookup.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 def _ssh_target_guess() -> str:
