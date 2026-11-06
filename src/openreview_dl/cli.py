@@ -10,6 +10,7 @@ import platform
 import re
 import socket
 import socketserver
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -22,7 +23,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import markdown
 import openreview
 import pypandoc
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -51,13 +52,30 @@ def get_config_dir() -> Path:
 
 def write_private(path: Path, text: str):
     """Write ``text`` to ``path`` so that only the current user can read it."""
+    try:
+        os.chmod(path, 0o600)  # tighten a pre-existing file before writing secrets into it
+    except OSError:
+        pass
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
     try:
-        os.chmod(path, 0o600)  # also tighten a file that already existed
+        os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _discard(path: Path, reason: str):
+    """Remove a cache file that can never become useful again; never raises."""
+    print(f"{reason}; removing {path}.")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"Could not remove it ({e}); it will be ignored.")
+
+
+class CacheError(Exception):
+    """The cache key or a cache file cannot be used (message says why)."""
 
 
 def get_credentials_path() -> Path:
@@ -65,18 +83,82 @@ def get_credentials_path() -> Path:
     return get_config_dir() / "credentials.enc"
 
 
-def get_key():
-    # Use a fixed salt (not ideal, but better than nothing)
+def get_key_path() -> Path:
+    """Path of the random key that encrypts the cached credentials and token."""
+    return get_config_dir() / "key"
+
+
+def legacy_key(hostname=None) -> bytes:
+    """The key versions before 0.4 derived from the hostname.
+
+    Kept only to read files written by those versions. The hostname is a poor
+    key source: on macOS it changes with the network (DHCP/reverse DNS, or a
+    ``-2`` suffix after an mDNS name clash), which made cached logins
+    undecryptable until wiped.
+    """
     salt = b"fixed_salt_for_openreview"
-    # Use the machine's hostname as a basis for the key
-    hostname = platform.uname().node.encode()
+    if hostname is None:
+        hostname = platform.uname().node
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
         iterations=100000,
     )
-    key = base64.urlsafe_b64encode(kdf.derive(hostname))
+    return base64.urlsafe_b64encode(kdf.derive(hostname.encode()))
+
+
+def _legacy_hostnames():
+    """Hostname spellings an older version may have used for its key.
+
+    Besides the current name this tries the bare and ``.local`` forms, the
+    mDNS clash variants (``name-2.local`` while the file was written as
+    ``name.local``, or the reverse) and, on macOS, the LocalHostName that the
+    machine falls back to when no network supplies a name.
+    """
+    node = platform.uname().node
+    short = node.split(".")[0]
+    base = re.sub(r"-\d+$", "", short)
+    stems = [short, base, f"{base}-2", f"{base}-3"]
+    if sys.platform == "darwin":
+        try:
+            local = subprocess.run(
+                ["scutil", "--get", "LocalHostName"],
+                capture_output=True, text=True, timeout=2, check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            local = ""
+        if local:
+            stems.append(local)
+    candidates = [node]
+    for stem in stems:
+        candidates += [stem, stem + ".local"]
+    return [h for i, h in enumerate(candidates) if h and h not in candidates[:i]]
+
+
+def get_key() -> bytes:
+    """A random key kept in the config dir, created on first use.
+
+    Unlike the hostname-derived key it does not change when the machine moves
+    to another network, so cached logins stay readable. Raises CacheError when
+    the key file exists but cannot be read or written.
+    """
+    path = get_key_path()
+    try:
+        key = path.read_bytes().strip()
+        Fernet(key)  # raises ValueError on a malformed key
+        return key
+    except FileNotFoundError:
+        pass
+    except ValueError:
+        print(f"The key file at {path} is malformed; replacing it.")
+    except OSError as e:
+        raise CacheError(f"Cannot read the key file at {path}: {e}") from e
+    key = Fernet.generate_key()
+    try:
+        write_private(path, key.decode())
+    except OSError as e:
+        raise CacheError(f"Cannot write the key file at {path}: {e}") from e
     return key
 
 
@@ -90,6 +172,49 @@ def decrypt(text):
     return f.decrypt(text.encode()).decode()
 
 
+def read_secret(path: Path, what: str):
+    """Decrypt the cached file at ``path``, or return None if there is nothing usable.
+
+    Files written by older versions (hostname-derived key) are re-encrypted
+    with the stable key on first read. A file that cannot be decrypted is left
+    in place (it may decrypt under another hostname later, and a new login
+    overwrites it anyway); the caller falls back to prompting. Never raises.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = path.read_bytes().decode("ascii").strip()  # Fernet tokens are base64
+    except UnicodeDecodeError:
+        _discard(path, f"The cached {what} at {path} is not an encrypted file")
+        return None
+    except OSError as e:
+        print(f"Could not read the cached {what} at {path}: {e}")
+        return None
+    try:
+        return decrypt(data)
+    except (InvalidToken, ValueError):
+        pass
+    except CacheError as e:
+        print(f"{e}. Continuing without the cached {what}.")
+        return None
+    for hostname in _legacy_hostnames():
+        try:
+            text = Fernet(legacy_key(hostname)).decrypt(data.encode()).decode()
+        except (InvalidToken, ValueError):
+            continue
+        try:
+            write_private(path, encrypt(text))  # migrate to the stable key
+        except (OSError, CacheError) as e:
+            print(f"Could not re-encrypt the cached {what} at {path}: {e}")
+        return text
+    print(
+        f"Could not decrypt the cached {what} at {path} (saved under a different "
+        "hostname by an older version, or with a key that no longer exists). "
+        f"You will be asked to log in again; caching again replaces it."
+    )
+    return None
+
+
 def delete_credentials():
     creds_path = get_credentials_path()
     if creds_path.exists():
@@ -98,22 +223,30 @@ def delete_credentials():
     else:
         print("No cached credentials found.")
     delete_token()
+    get_key_path().unlink(missing_ok=True)
 
 
 def load_cached_credentials():
     creds_path = get_credentials_path()
-    if creds_path.exists():
-        with open(creds_path, "r") as f:
-            creds = json.loads(decrypt(f.read()))
+    text = read_secret(creds_path, "credentials")
+    if text is None:
+        return None, None
+    try:
+        creds = json.loads(text)
         return creds["username"], creds["password"]
-    return None, None
+    except (ValueError, KeyError, TypeError):
+        _discard(creds_path, f"The cached credentials at {creds_path} are malformed")
+        return None, None
 
 
 def save_credentials(username, password):
     creds = {"username": username, "password": password}
-    encrypted = encrypt(json.dumps(creds))
     creds_path = get_credentials_path()
-    write_private(creds_path, encrypted)
+    try:
+        write_private(creds_path, encrypt(json.dumps(creds)))
+    except (OSError, CacheError) as e:
+        print(f"Could not cache the credentials: {e}")
+        return
     print(f"Credentials cached at: {creds_path}")
 
 
@@ -202,25 +335,22 @@ def describe_expiry(token: str) -> str:
 
 def save_token(token: str):
     path = get_token_path()
-    write_private(path, encrypt(token))
+    try:
+        write_private(path, encrypt(token))
+    except (OSError, CacheError) as e:
+        print(f"Could not cache the token: {e}")
+        return
     print(f"Token cached at: {path} ({describe_expiry(token)})")
 
 
 def load_cached_token():
     """The cached token if present and not expired, else None (expired ones are removed)."""
     path = get_token_path()
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r") as f:
-            token = decrypt(f.read())
-    except Exception:
-        print(f"Could not read the cached token at {path}; removing it.")
-        path.unlink(missing_ok=True)
+    token = read_secret(path, "token")
+    if token is None:
         return None
     if token_is_expired(token):
-        print(f"The cached token expired ({describe_expiry(token)}).")
-        path.unlink(missing_ok=True)
+        _discard(path, f"The cached token expired ({describe_expiry(token)})")
         return None
     return token
 
@@ -228,7 +358,11 @@ def load_cached_token():
 def delete_token():
     path = get_token_path()
     if path.exists():
-        path.unlink()
+        try:
+            path.unlink()
+        except OSError as e:
+            print(f"Could not delete the cached token at {path}: {e}")
+            return
         print(f"Cached token deleted from: {path}")
 
 
@@ -727,6 +861,34 @@ def process_note_thread(note_id, notes_by_id, depth=0):
     return markdown_text
 
 
+def format_value(value) -> str:
+    """Render a note field for Markdown, whatever shape the venue's schema gives it.
+
+    OpenReview fields are usually strings or lists of strings, but some venues
+    use structured values (e.g. a list of ``{"value": ..., "label": ...}``
+    dicts). Never raises on the shape of the data.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("value", "name", "fullname", "label", "id"):
+            if isinstance(value.get(key), str):
+                return value[key]
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(format_value(item) for item in value)
+    return str(value)
+
+
+def _field_value(field):
+    """The ``value`` of an API v2 content field, or the field itself for v1 data."""
+    if isinstance(field, dict) and "value" in field:
+        return field["value"]
+    return field
+
+
 def process_full_paper(paper):
     markdown_text = f"### Paper ID: {paper['id']}\n\n"
 
@@ -744,39 +906,19 @@ def process_full_paper(paper):
         "paperhash",
     ]
 
-    try:
-        # Process essential fields
-        for field in essential_fields:
-            if field in content:
-                if field == "authors":
-                    markdown_text += f"**{field.capitalize()}:** {', '.join(content[field]['value'])}\n\n"
-                else:
-                    markdown_text += (
-                        f"**{field.capitalize()}:** {content[field]['value']}\n\n"
-                    )
-            else:
-                print(f"Warning: Essential field '{field}' is missing.")
+    for field in essential_fields:
+        if field in content:
+            markdown_text += (
+                f"**{field.capitalize()}:** {format_value(_field_value(content[field]))}\n\n"
+            )
+        else:
+            print(f"Warning: Essential field '{field}' is missing.")
 
-        # Process additional fields
-        for field in additional_fields:
-            if field in content:
-                if isinstance(content[field]["value"], list):
-                    markdown_text += f"**{field.capitalize()}:** {', '.join(content[field]['value'])}\n\n"
-                else:
-                    markdown_text += (
-                        f"**{field.capitalize()}:** {content[field]['value']}\n\n"
-                    )
-
-    except KeyError as e:
-        print(f"KeyError: {e}")
-        print("Available keys in content:")
-        for key in content.keys():
-            print(f"- {key}")
-
-        # Add available information to markdown
-        for key, value in content.items():
-            if isinstance(value, dict) and "value" in value:
-                markdown_text += f"**{key.capitalize()}:** {value['value']}\n\n"
+    for field in additional_fields:
+        if field in content:
+            markdown_text += (
+                f"**{field.capitalize()}:** {format_value(_field_value(content[field]))}\n\n"
+            )
 
     markdown_text += "---\n\n"
     return markdown_text
@@ -788,7 +930,7 @@ def process_note(note, is_rebuttal=False):
     content = note["content"]
     for key, value in content.items():
         if isinstance(value, dict) and "value" in value:
-            markdown_text += f"**{key.capitalize()}:**\n {value['value']}\n\n"
+            markdown_text += f"**{key.capitalize()}:**\n {format_value(value['value'])}\n\n"
 
     markdown_text += "---\n\n"
     return markdown_text
@@ -902,7 +1044,12 @@ def resolve_client(args, passkey_port):
                 token, source = normalize_token(pasted), "paste"
 
     if not token:
-        return password_login(args, passkey_port)
+        client = password_login(args, passkey_port)
+        # Reuse this session next time instead of asking for the password and MFA again.
+        new_token = getattr(client, "token", None)
+        if new_token:
+            save_token(new_token)
+        return client
 
     if token_is_expired(token):
         print(f"That token has expired ({describe_expiry(token)}).")
@@ -1043,7 +1190,8 @@ def main():
         print("\nCancelled.")
         return 130
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        detail = str(e) or "no details"
+        print(f"An unexpected error occurred ({type(e).__name__}): {detail}")
         return 1
 
 
