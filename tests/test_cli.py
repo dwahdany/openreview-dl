@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import platform
 import socket
 import sys
 import tempfile
@@ -1072,11 +1073,30 @@ class TestTokenCache:
         assert not (self.config_dir / "token.enc").exists()
         assert "expired" in capsys.readouterr().out
 
-    def test_unreadable_cache_is_removed(self, capsys):
+    def test_undecryptable_cache_is_kept_but_ignored(self, capsys):
         (self.config_dir / "token.enc").write_text("not encrypted")
         assert cli.load_cached_token() is None
+        assert (self.config_dir / "token.enc").exists()  # may decrypt under another hostname later
+        assert "Could not decrypt the cached token" in capsys.readouterr().out
+
+    def test_binary_garbage_cache_is_removed(self, capsys):
+        (self.config_dir / "token.enc").write_bytes(b"\xff\xfe\x00garbage")
+        assert cli.load_cached_token() is None
         assert not (self.config_dir / "token.enc").exists()
-        assert "Could not read the cached token" in capsys.readouterr().out
+        assert "not an encrypted file" in capsys.readouterr().out
+
+    def test_legacy_hostname_encrypted_token_is_migrated(self, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        token = _jwt(exp=FUTURE)
+        legacy = Fernet(cli.legacy_key("laptop.local")).encrypt(token.encode()).decode()
+        (self.config_dir / "token.enc").write_text(legacy)
+        real = platform.uname()
+        monkeypatch.setattr(cli.platform, "uname", lambda: real._replace(node="laptop.local"))
+        assert cli.load_cached_token() == token
+        # Re-encrypted with the stable key: readable even if the hostname changes now.
+        assert (self.config_dir / "token.enc").read_text() != legacy
+        assert cli.decrypt((self.config_dir / "token.enc").read_text()) == token
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
     def test_cache_files_are_private(self, capsys):
@@ -1263,6 +1283,22 @@ class TestResolveClient:
         assert client.kwargs["username"] == "user@example.org"
         assert self.installed == [{"no_browser": None, "port": 0, "username": "user@example.org"}]
 
+    def test_password_login_caches_its_token_for_next_time(self, capsys):
+        client = cli.resolve_client(_Args(), 0)
+        assert client.token == "issued.token.value"
+        assert "Token cached at" in capsys.readouterr().out
+        assert cli.load_cached_token() == "issued.token.value"
+
+    def test_password_login_without_token_caches_nothing(self, monkeypatch):
+        class NoTokenClient(_FakeOpenReviewClient):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.token = None
+
+        monkeypatch.setattr(cli.openreview.api, "OpenReviewClient", NoTokenClient)
+        cli.resolve_client(_Args(), 0)
+        assert not (self.config_dir / "token.enc").exists()
+
 
 class TestAuthCommand:
     """Tests for auth_command / --auth."""
@@ -1350,3 +1386,289 @@ class TestMainTokenRouting:
         assert not (self.config_dir / "credentials.enc").exists()
         out = capsys.readouterr().out
         assert "Cached credentials deleted" in out and "Cached token deleted" in out
+
+
+def cli_encrypt_with_random_key(text: str) -> str:
+    from cryptography.fernet import Fernet
+
+    return Fernet(Fernet.generate_key()).encrypt(text.encode()).decode()
+
+
+class TestStableKeyAndCredentialRecovery:
+    """The cache key no longer depends on the hostname, and bad caches recover without --wipe-credentials."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_config_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli, "get_config_dir", lambda: tmp_path)
+        self.config_dir = tmp_path
+
+    def _set_hostname(self, monkeypatch, name):
+        real = platform.uname()
+        monkeypatch.setattr(cli.platform, "uname", lambda: real._replace(node=name))
+
+    def test_key_is_created_once_and_reused(self):
+        assert not (self.config_dir / "key").exists()
+        key = cli.get_key()
+        assert (self.config_dir / "key").exists()
+        assert cli.get_key() == key
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_key_file_is_private(self):
+        import stat
+
+        cli.get_key()
+        assert stat.S_IMODE((self.config_dir / "key").stat().st_mode) == 0o600
+
+    def test_key_survives_hostname_change(self, monkeypatch):
+        self._set_hostname(monkeypatch, "laptop.home.arpa")
+        cli.save_credentials("user@example.org", "pw")
+        self._set_hostname(monkeypatch, "laptop-2.local")
+        assert cli.load_cached_credentials() == ("user@example.org", "pw")
+
+    def test_legacy_key_depends_on_hostname(self, monkeypatch):
+        self._set_hostname(monkeypatch, "a.local")
+        key_a = cli.legacy_key()
+        self._set_hostname(monkeypatch, "b.local")
+        assert cli.legacy_key() != key_a
+        assert cli.legacy_key("a.local") == key_a
+
+    def test_legacy_credentials_are_migrated(self, monkeypatch, capsys):
+        from cryptography.fernet import Fernet
+
+        self._set_hostname(monkeypatch, "laptop.local")
+        payload = json.dumps({"username": "user@example.org", "password": "pw"})
+        legacy = Fernet(cli.legacy_key()).encrypt(payload.encode()).decode()
+        (self.config_dir / "credentials.enc").write_text(legacy)
+        assert cli.load_cached_credentials() == ("user@example.org", "pw")
+        assert "removing" not in capsys.readouterr().out
+        # Written back with the stable key.
+        assert (self.config_dir / "credentials.enc").read_text() != legacy
+        self._set_hostname(monkeypatch, "laptop.fritz.box")
+        assert cli.load_cached_credentials() == ("user@example.org", "pw")
+
+    def test_legacy_file_from_other_hostname_spelling_is_migrated(self, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        payload = json.dumps({"username": "u", "password": "p"})
+        # Saved while the hostname was the bare LocalHostName, read with the .local form.
+        legacy = Fernet(cli.legacy_key("laptop")).encrypt(payload.encode()).decode()
+        (self.config_dir / "credentials.enc").write_text(legacy)
+        self._set_hostname(monkeypatch, "laptop.local")
+        assert cli.load_cached_credentials() == ("u", "p")
+
+    def test_undecryptable_credentials_are_kept_not_fatal(self, monkeypatch, capsys):
+        from cryptography.fernet import Fernet
+
+        payload = json.dumps({"username": "u", "password": "p"})
+        other_host = Fernet(cli.legacy_key("dhcp-12-34.uni.example")).encrypt(payload.encode()).decode()
+        (self.config_dir / "credentials.enc").write_text(other_host)
+        self._set_hostname(monkeypatch, "laptop.local")
+        assert cli.load_cached_credentials() == (None, None)
+        assert "Could not decrypt the cached credentials" in capsys.readouterr().out
+        # Kept: back on the network that gave the old hostname it migrates cleanly.
+        assert (self.config_dir / "credentials.enc").read_text() == other_host
+        self._set_hostname(monkeypatch, "dhcp-12-34.uni.example")
+        assert cli.load_cached_credentials() == ("u", "p")
+        self._set_hostname(monkeypatch, "laptop.local")
+        assert cli.load_cached_credentials() == ("u", "p")  # now on the stable key
+
+    @pytest.mark.parametrize(
+        "saved_as, now",
+        [
+            ("laptop.local", "laptop-2.local"),  # mDNS name clash added a suffix
+            ("laptop-2.local", "laptop.local"),  # ...and later went away
+            ("laptop-2", "laptop-3.local"),
+            ("laptop", "laptop.fritz.box"),  # saved without network suffix
+            ("laptop.local", "laptop"),  # node reported without .local
+        ],
+    )
+    def test_hostname_variants_are_migrated(self, monkeypatch, saved_as, now):
+        from cryptography.fernet import Fernet
+
+        payload = json.dumps({"username": "u", "password": "p"})
+        legacy = Fernet(cli.legacy_key(saved_as)).encrypt(payload.encode()).decode()
+        (self.config_dir / "credentials.enc").write_text(legacy)
+        self._set_hostname(monkeypatch, now)
+        assert cli.load_cached_credentials() == ("u", "p")
+
+    def test_macos_local_hostname_is_tried(self, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        payload = json.dumps({"username": "u", "password": "p"})
+        legacy = Fernet(cli.legacy_key("My-Mac.local")).encrypt(payload.encode()).decode()
+        (self.config_dir / "credentials.enc").write_text(legacy)
+        self._set_hostname(monkeypatch, "dhcp-7-8.campus.example")
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+        class Done:
+            stdout = "My-Mac\n"
+
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: Done())
+        assert cli.load_cached_credentials() == ("u", "p")
+
+    def test_garbage_credentials_file_is_ignored_not_fatal(self, capsys):
+        (self.config_dir / "credentials.enc").write_text("not encrypted at all")
+        assert cli.load_cached_credentials() == (None, None)
+        assert "Could not decrypt" in capsys.readouterr().out
+
+    def test_binary_garbage_credentials_file_is_removed(self, capsys):
+        (self.config_dir / "credentials.enc").write_bytes(b"\xff\xfe\x00garbage")
+        assert cli.load_cached_credentials() == (None, None)
+        assert not (self.config_dir / "credentials.enc").exists()
+
+    def test_malformed_json_is_removed(self, capsys):
+        (self.config_dir / "credentials.enc").write_text(cli.encrypt("[1, 2]"))
+        assert cli.load_cached_credentials() == (None, None)
+        assert not (self.config_dir / "credentials.enc").exists()
+        assert "malformed" in capsys.readouterr().out
+
+    def test_corrupt_key_file_is_replaced(self, capsys):
+        (self.config_dir / "key").write_text("garbage")
+        key = cli.get_key()
+        assert "malformed" in capsys.readouterr().out
+        assert cli.get_key() == key
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0, reason="POSIX permission bits"
+    )
+    def test_unreadable_key_file_is_not_replaced_and_nothing_raises(self, capsys):
+        cli.save_credentials("u", "p")
+        key_before = (self.config_dir / "key").read_bytes()
+        (self.config_dir / "key").chmod(0o000)
+        try:
+            with pytest.raises(cli.CacheError):
+                cli.get_key()
+            assert cli.load_cached_credentials() == (None, None)
+            assert cli.load_cached_token() is None
+            cli.save_credentials("u", "p")  # prints, does not raise
+            cli.save_token(_jwt(exp=FUTURE))
+            out = capsys.readouterr().out
+            assert "Cannot read the key file" in out
+            assert "Could not cache" in out
+        finally:
+            (self.config_dir / "key").chmod(0o600)
+        assert (self.config_dir / "key").read_bytes() == key_before
+        assert cli.load_cached_credentials() == ("u", "p")
+
+    def test_key_path_is_a_directory_does_not_raise(self, capsys):
+        (self.config_dir / "key").mkdir()
+        (self.config_dir / "credentials.enc").write_text(cli_encrypt_with_random_key("x"))
+        assert cli.load_cached_credentials() == (None, None)
+        assert "Cannot read the key file" in capsys.readouterr().out
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0, reason="POSIX permission bits"
+    )
+    def test_read_only_config_dir_does_not_raise(self, capsys):
+        cli.get_key()
+        (self.config_dir / "credentials.enc").write_text(cli.encrypt("[1, 2]"))  # malformed JSON
+        (self.config_dir / "token.enc").write_text(cli.encrypt(_jwt(exp=PAST)))  # expired
+        self.config_dir.chmod(0o500)
+        try:
+            assert cli.load_cached_credentials() == (None, None)
+            assert cli.load_cached_token() is None
+            out = capsys.readouterr().out
+            assert out.count("Could not remove it") == 2
+        finally:
+            self.config_dir.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+    def test_migration_tightens_loose_legacy_file(self, monkeypatch):
+        import stat
+
+        from cryptography.fernet import Fernet
+
+        payload = json.dumps({"username": "u", "password": "p"})
+        path = self.config_dir / "credentials.enc"
+        path.write_text(Fernet(cli.legacy_key("laptop.local")).encrypt(payload.encode()).decode())
+        path.chmod(0o644)  # pre-0.4 versions wrote with plain open()
+        self._set_hostname(monkeypatch, "laptop.local")
+        assert cli.load_cached_credentials() == ("u", "p")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_wipe_removes_key_too(self, capsys):
+        cli.save_credentials("u", "p")
+        assert (self.config_dir / "key").exists()
+        cli.delete_credentials()
+        assert not (self.config_dir / "key").exists()
+
+
+class TestUnexpectedErrorMessage:
+    def test_names_the_exception_type_when_message_is_empty(self, monkeypatch, capsys):
+        from cryptography.fernet import InvalidToken
+
+        def boom(args, passkey_port):
+            raise InvalidToken()
+
+        monkeypatch.setattr(cli, "download_command", boom)
+        monkeypatch.setattr(sys, "argv", ["openreview-dl"])
+        assert cli.main() == 1
+        assert "An unexpected error occurred (InvalidToken): no details" in capsys.readouterr().out
+
+
+class TestFormatValue:
+    """Content fields come in many shapes; rendering must never raise."""
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("plain", "plain"),
+            (["a", "b"], "a, b"),
+            ([], ""),
+            (None, ""),
+            (3, "3"),
+            ({"value": "inner"}, "inner"),
+            ([{"value": "ml", "label": "Machine learning"}, {"value": "nlp"}], "ml, nlp"),
+            ([{"name": "Ada Lovelace", "affiliation": "x"}], "Ada Lovelace"),
+            ({"weird": 1}, '{"weird": 1}'),
+            ([["nested", "list"], "c"], "nested, list, c"),
+        ],
+    )
+    def test_shapes(self, value, expected):
+        assert cli.format_value(value) == expected
+
+    def test_full_paper_with_structured_fields(self, capsys):
+        paper = {
+            "id": "abc",
+            "content": {
+                "title": {"value": "A Paper"},
+                "authors": {"value": [{"name": "Ada", "id": "~Ada1"}, {"name": "Bob"}]},
+                "abstract": {"value": "Words."},
+                "keywords": {"value": [{"value": "ml"}, {"value": "privacy"}]},
+                "primary_keywords": {"value": "single"},
+                "venue": {"value": "ICLR 2027 Conference Submission"},
+            },
+        }
+        md = cli.process_full_paper(paper)
+        assert "**Authors:** Ada, Bob" in md
+        assert "**Keywords:** ml, privacy" in md
+        assert "**Primary_keywords:** single" in md
+        assert "Warning" not in capsys.readouterr().out
+
+    def test_full_paper_missing_essential_field_warns(self, capsys):
+        md = cli.process_full_paper({"id": "x", "content": {"title": {"value": "T"}}})
+        assert "**Title:** T" in md
+        out = capsys.readouterr().out
+        assert "Essential field 'authors' is missing" in out
+        assert "Essential field 'abstract' is missing" in out
+
+    def test_note_with_list_value(self):
+        note = {"number": 1, "id": "n1", "content": {"strengths": {"value": ["clear", "novel"]}, "rating": {"value": 8}}}
+        md = cli.process_note(note)
+        assert "**Strengths:**\n clear, novel" in md
+        assert "**Rating:**\n 8" in md
+
+    def test_generate_markdown_end_to_end_with_dict_authors(self):
+        notes = [
+            {"id": "p", "replyto": None, "signatures": ["Conf/Authors"], "cdate": 1,
+             "content": {"title": {"value": "T"}, "authors": {"value": [{"name": "Ada"}]}, "abstract": {"value": "A"}}},
+            {"id": "r1", "number": 1, "replyto": "p", "signatures": ["Conf/Submission1/Reviewer_abcd"], "cdate": 2,
+             "content": {"summary": {"value": "Good."}}},
+            {"id": "a1", "number": 2, "replyto": "r1", "signatures": ["Conf/Submission1/Authors"], "cdate": 3,
+             "content": {"comment": {"value": ["thanks", "fixed"]}}},
+        ]
+        md = cli.generate_markdown(notes)
+        assert "**Authors:** Ada" in md
+        assert "## abcd" in md  # extract_reviewer_id keeps only the suffix
+        assert "Rebuttal to Note 2" in md
+        assert "thanks, fixed" in md

@@ -5,7 +5,7 @@ Download OpenReview paper reviews and rebuttals as formatted documents (ODT and 
 ## Features
 
 - Extracts forum ID and venue ID from an OpenReview URL
-- Optional credential caching (machine-specific encryption)
+- Optional credential caching (encrypted with a key kept in your config directory)
 - Fetches paper details, reviews, and rebuttals
 - Generates a formatted markdown document
 - Converts the markdown to an ODT file for easy reading
@@ -48,7 +48,7 @@ uvx openreview-dl
 You'll be prompted to:
 1. Enter the full OpenReview URL (example: `https://openreview.net/forum?id=XXXXXXXXXXXX&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DConference.org%2FYYYY%2FMeeting%2FAuthors%23your-submissions)`)
 2. Provide your OpenReview username and password
-3. Optionally cache credentials for future use (stored in `~/.config/openreview-dl/credentials.enc` with machine-specific encryption)
+3. Optionally cache credentials for future use (stored encrypted in `~/.config/openreview-dl/credentials.enc`)
 
 The tool will generate:
 - `output/$FORUM_ID.md` - Markdown formatted file
@@ -87,7 +87,7 @@ Run that from your laptop, open the URL in your local browser, and finish the pa
 If you choose to cache credentials, they are stored at:
 - **Linux/macOS**: `~/.config/openreview-dl/credentials.enc`
 
-The credentials are encrypted using machine-specific keys (hostname-based), so they won't work if copied to another machine. However, this is not fully secure - anyone with access to your user account can potentially decrypt them.
+The credentials are encrypted with a random key stored next to them in `~/.config/openreview-dl/key`; both files are readable only by your user. This is not fully secure - anyone with access to your user account can decrypt them. Caches written by versions before 0.4 used a hostname-derived key, which broke whenever macOS picked a different hostname on a new network; those files are converted to the new key on first use. A cache that cannot be decrypted is left alone and you are simply asked to log in again; caching again replaces it.
 
 ## Note
 
