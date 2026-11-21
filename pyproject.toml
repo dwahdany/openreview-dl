@@ -25,6 +25,7 @@ dependencies = [
     "markdown>=3.8.1",
     "openreview-py>=2.0.0",
     "pypandoc>=1.15",
+    "textual>=6.0.0,<9",
     "urllib3>=2.7.0",
 ]
 
