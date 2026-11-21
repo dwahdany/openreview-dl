@@ -2,6 +2,7 @@ import argparse
 import base64
 import functools
 import getpass
+import glob
 import http.server
 import importlib
 import json
@@ -26,6 +27,8 @@ import pypandoc
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+from . import discover, picker
 
 _pandoc_checked = False
 
@@ -812,51 +815,144 @@ def extract_reviewer_id(signature):
     return match.group(2) if match else None
 
 
-def generate_markdown(notes):
+def _first_signature(note) -> str:
+    signatures = note.get("signatures") or [""]
+    return signatures[0] if isinstance(signatures[0], str) else ""
+
+
+def _note_kind(note) -> str:
+    """What a note is, from its invitation: "Official Review", "Decision", ..."""
+    invitations = note.get("invitations") or [note.get("invitation")]
+    first = invitations[0] if invitations and isinstance(invitations[0], str) else ""
+    return first.split("/-/")[-1].replace("_", " ").strip() or "Note"
+
+
+def _signer_label(signature: str) -> str:
+    """Readable signer: "Reviewer abcd", "Program Chairs", "Authors"."""
+    last = signature.split("/")[-1]
+    try:
+        label = openreview.tools.pretty_id(last)
+    except Exception:
+        label = None
+    return label or last.replace("_", " ").strip() or "Unknown"
+
+
+def _created(note):
+    # The id breaks ties, so the output does not depend on the order of the input.
+    created = note.get("cdate")
+    return (created if isinstance(created, (int, float)) else 0, str(note.get("id")))
+
+
+def generate_markdown(notes, include_all=False):
+    """Render a forum (the submission note and its replies) as Markdown.
+
+    By default only the reviewers' threads are included, each under the
+    reviewer's anonymous id. With ``include_all`` every other note follows as
+    well (meta-reviews, decisions, comments by authors or chairs), in a stable
+    order, so nothing a reviewer or area chair can see is left out.
+    """
+    notes = [note for note in notes if isinstance(note, dict) and note.get("id")]
     # Separate the full paper and other notes
-    full_paper = next((note for note in notes if note["replyto"] is None), None)
-    other_notes = [note for note in notes if note["replyto"] is not None]
+    full_paper = next((note for note in notes if note.get("replyto") is None), None)
+    other_notes = [note for note in notes if note is not full_paper]
+    if full_paper:
+        root_id = full_paper["id"]
+    else:  # the submission itself is not readable: hang the replies off its id
+        root_id = next((note.get("forum") for note in other_notes if note.get("forum")), None)
 
     markdown_text = ""
 
     # Process full paper
     if full_paper:
         markdown_text += "# Full Paper\n\n"
-        markdown_text += process_full_paper(full_paper)
+        # A reviewer sees an anonymous paper: no "authors missing" warning then.
+        markdown_text += process_full_paper(full_paper, warn=not include_all)
 
     # Create a dictionary to store notes by their ID
     notes_by_id = {note["id"]: note for note in other_notes}
+    top_level = [note for note in other_notes if note.get("replyto") == root_id]
+    if include_all:
+        top_level.sort(key=_created)
 
     # Group top-level reviews by reviewer
     reviewer_groups = {}
-    for note in other_notes:
-        if note["replyto"] == full_paper["id"]:
-            reviewer_id = extract_reviewer_id(note["signatures"])
-            if reviewer_id:
-                reviewer_groups[reviewer_id] = note["id"]
+    for note in top_level:
+        reviewer_id = extract_reviewer_id([_first_signature(note)])
+        if reviewer_id:
+            reviewer_groups.setdefault(reviewer_id, []).append(note)
+
+    seen = set()
 
     # Process reviewer notes and their replies
-    for reviewer_id, top_review_id in reviewer_groups.items():
-        markdown_text += f"## {reviewer_id}\n\n"
-        markdown_text += process_note_thread(top_review_id, notes_by_id)
+    for reviewer_id, reviewer_notes in reviewer_groups.items():
+        heading = reviewer_id
+        if include_all:  # "Reviewer abcd", "Ethics Reviewer abcd", ...
+            heading = _signer_label(_first_signature(reviewer_notes[0]))
+        markdown_text += f"## {heading}\n\n"
+        for note in sorted(reviewer_notes, key=_created):
+            markdown_text += process_note_thread(
+                note["id"], notes_by_id, seen=seen, detailed=include_all
+            )
+
+    if include_all:
+        sections = {}
+        for note in top_level:
+            if note["id"] not in seen:
+                label = _signer_label(_first_signature(note))
+                sections.setdefault(label, []).append(note)
+        for label, section_notes in sections.items():
+            markdown_text += f"## {label}\n\n"
+            for note in section_notes:
+                markdown_text += process_note_thread(
+                    note["id"], notes_by_id, seen=seen, detailed=True
+                )
+        # Replies whose parent is not readable would otherwise vanish.
+        orphans = [
+            note
+            for note in sorted(other_notes, key=_created)
+            if note["id"] not in seen and note.get("replyto") not in notes_by_id
+        ]
+        # ...and so would notes that reply to themselves or to each other.
+        orphans += [n for n in sorted(other_notes, key=_created) if n.get("replyto") in notes_by_id]
+        rest = ""
+        for note in orphans:
+            rest += process_note_thread(note["id"], notes_by_id, seen=seen, detailed=True)
+        if rest:
+            markdown_text += "## Other notes\n\n" + rest
 
     return markdown_text.strip()
 
 
-def process_note_thread(note_id, notes_by_id, depth=0):
-    markdown_text = ""
+def process_note_thread(note_id, notes_by_id, depth=0, seen=None, detailed=False):
+    if seen is None:
+        seen = set()
+    if note_id in seen:  # never render a note twice (or loop on bad data)
+        return ""
+    seen.add(note_id)
     note = notes_by_id[note_id]
 
-    # Process the current note
-    markdown_text += "  " * depth
-    markdown_text += process_note(note, is_rebuttal="Authors" in note["signatures"][0])
+    # Process the current note. Replies get a deeper heading level; indenting
+    # them instead would turn their headings into plain text or code blocks.
+    markdown_text = process_note(
+        note,
+        is_rebuttal="Authors" in _first_signature(note),
+        depth=depth,
+        detailed=detailed,
+    )
+    parent = notes_by_id.get(note.get("replyto"))
+    if detailed and depth >= 3 and parent is not None:
+        # Headings stop at level six, so say what a deep reply answers.
+        answered = f"*In reply to {_signer_label(_first_signature(parent))} (ID: {parent['id']})*"
+        markdown_text = markdown_text.replace("\n\n", f"\n\n{answered}\n\n", 1)
 
     # Process replies to this note
-    replies = [n for n in notes_by_id.values() if n["replyto"] == note_id]
-    replies.sort(key=itemgetter("cdate"))
+    replies = [n for n in notes_by_id.values() if n.get("replyto") == note_id]
+    replies.sort(key=_created)
 
     for reply in replies:
-        markdown_text += process_note_thread(reply["id"], notes_by_id, depth + 1)
+        markdown_text += process_note_thread(
+            reply["id"], notes_by_id, depth + 1, seen=seen, detailed=detailed
+        )
 
     return markdown_text
 
@@ -889,10 +985,10 @@ def _field_value(field):
     return field
 
 
-def process_full_paper(paper):
+def process_full_paper(paper, warn=True):
     markdown_text = f"### Paper ID: {paper['id']}\n\n"
 
-    content = paper["content"]
+    content = paper.get("content") or {}
     # Essential fields that should always be present
     essential_fields = ["title", "authors", "abstract"]
 
@@ -911,7 +1007,7 @@ def process_full_paper(paper):
             markdown_text += (
                 f"**{field.capitalize()}:** {format_value(_field_value(content[field]))}\n\n"
             )
-        else:
+        elif warn:
             print(f"Warning: Essential field '{field}' is missing.")
 
     for field in additional_fields:
@@ -924,10 +1020,18 @@ def process_full_paper(paper):
     return markdown_text
 
 
-def process_note(note, is_rebuttal=False):
-    markdown_text = f"### {'Rebuttal to ' if is_rebuttal else ''}Note {note['number']} (ID: {note['id']})\n\n"
+def process_note(note, is_rebuttal=False, depth=0, detailed=False):
+    heading = "#" * min(3 + depth, 6)
+    if detailed:
+        title = (
+            f"{_note_kind(note)} by {_signer_label(_first_signature(note))} "
+            f"(Note {note.get('number')}, ID: {note['id']})"
+        )
+    else:
+        title = f"{'Rebuttal to ' if is_rebuttal else ''}Note {note.get('number')} (ID: {note['id']})"
+    markdown_text = f"{heading} {title}\n\n"
 
-    content = note["content"]
+    content = note.get("content") or {}
     for key, value in content.items():
         if isinstance(value, dict) and "value" in value:
             markdown_text += f"**{key.capitalize()}:**\n {format_value(value['value'])}\n\n"
@@ -936,14 +1040,15 @@ def process_note(note, is_rebuttal=False):
     return markdown_text
 
 
-def markdown_to_odt(markdown_text, output_filename):
+def markdown_to_odt(markdown_text, output_filename, quiet=False):
     _ensure_pandoc()
     # Convert markdown to HTML
     html = markdown.markdown(markdown_text)
 
     # Convert HTML to ODT
     pypandoc.convert_text(html, "odt", format="html", outputfile=output_filename)
-    print(f"ODT file created: {output_filename}")
+    if not quiet:
+        print(f"ODT file created: {output_filename}")
 
 
 def ensure_output_dir(output_dir: str) -> Path:
@@ -1079,7 +1184,11 @@ def resolve_client(args, passkey_port):
 
 def download_command(args, passkey_port) -> int:
     """Prompt for a forum URL, log in, and write the Markdown and ODT files."""
-    url = input("Enter the OpenReview URL: ")
+    can_pick = picker.can_run_picker()
+    hint = " (or press Enter to pick from your submissions)" if can_pick else ""
+    url = input(f"Enter the OpenReview URL{hint}: ")
+    if not url.strip() and can_pick:
+        return bulk_command(args, passkey_port, "pick")
     forum_id, venue_id = parse_openreview_url(url)
     if not forum_id or not venue_id:
         print("Error: Couldn't extract forum ID or venue ID from the URL.")
@@ -1112,6 +1221,282 @@ def download_command(args, passkey_port) -> int:
     odt_filename = get_unique_filename(str(odt_filename))
     markdown_to_odt(markdown_output, str(odt_filename))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Everything the user can reach: --pick, --all, --list
+#
+# discover.list_submissions() finds the submissions the logged-in user
+# authored or holds a role on (reviewer, area chair, ...), replies included.
+# They are either all downloaded, or offered in a terminal selector first.
+# ---------------------------------------------------------------------------
+
+# Pause between forums that need a request of their own; OpenReview allows a
+# logged-in user only a few hundred requests per hour.
+BULK_PAUSE = 0.5
+# Stop a batch when this many forums in a row fail: something bigger is wrong
+# (network down, session gone) and the remaining ones would fail the same way.
+MAX_CONSECUTIVE_FAILURES = 3
+
+_ROLE_ALIASES = {
+    "ac": "areachair",
+    "sac": "seniorareachair",
+    "ae": "actioneditor",
+    "pc": "reviewer",
+}
+
+
+def _role_key(role: str) -> str:
+    key = re.sub(r"[^a-z]", "", role.lower())
+    if key not in _ROLE_ALIASES and key.endswith("s"):
+        key = key[:-1]
+    return _ROLE_ALIASES.get(key, key)
+
+
+def filter_by_role(submissions, wanted):
+    """Keep submissions on which the user holds one of the ``wanted`` roles.
+
+    Matching ignores case, punctuation and a plural "s" ("reviewers",
+    "area-chair", "AC"). A submission is then listed under the matching role.
+    """
+    keys = {_role_key(role) for role in wanted if _role_key(role)}
+    kept = []
+    for sub in submissions:
+        matching = [role for role in sub.roles if _role_key(role) in keys]
+        if matching:
+            sub.roles = matching + [role for role in sub.roles if role not in matching]
+            kept.append(sub)
+    return discover.sort_submissions(kept)
+
+
+def _slug(text, limit=None) -> str:
+    """A file-name-safe version of ``text`` (may be empty)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text or "").strip("-.")
+    if limit:
+        slug = slug[:limit].rstrip("-.")
+    return slug
+
+
+def submission_paths(sub, output_dir):
+    """``(markdown path, odt path)``: <out>/<venue>/<number>_<title>_<forum id>.*"""
+    directory = Path(output_dir) / (_slug(sub.venue_id) or "unknown-venue")
+    parts = [
+        str(sub.number) if sub.number is not None else "",
+        _slug(sub.title, limit=60),
+        _slug(sub.forum) or "forum",
+    ]
+    base = "_".join(part for part in parts if part)
+    return directory / f"{base}.md", directory / f"{base}.odt"
+
+
+def _describe(sub) -> str:
+    number = f" #{sub.number}" if sub.number is not None else ""
+    title = picker._clean(str(sub.title))  # written by other people: no control codes
+    if len(title) > 70:
+        title = title[:69] + "…"
+    return f"{sub.role} · {sub.venue_id}{number} · {title}"
+
+
+def print_listing(submissions, unresolved=()):
+    """Print the submissions grouped by role and venue (for --list)."""
+    group = None
+    for sub in submissions:
+        if (sub.role, sub.venue_id) != group:
+            group = (sub.role, sub.venue_id)
+            count = sum(1 for s in submissions if (s.role, s.venue_id) == group)
+            print(f"\n{sub.role} · {sub.venue_id} ({count})")
+        number = f"#{sub.number}" if sub.number is not None else ""
+        title = picker._clean(str(sub.title))
+        print(f"  {number:>7}  {sub.forum}  [{picker._clean(str(sub.status))}]  {title}")
+    print(f"\n{len(submissions)} submission(s).")
+    _print_unresolved(unresolved)
+
+
+def _print_unresolved(unresolved):
+    if not unresolved:
+        return
+    print(
+        f"\n{len(unresolved)} paper(s) you hold a role on could not be read and are "
+        "left out (usually deleted submissions; otherwise not visible to you yet, "
+        "or a venue with an unusual setup):"
+    )
+    for item in unresolved:
+        print(f"  {item.venue_id} #{item.number} ({', '.join(item.roles) or 'member'})")
+
+
+def _error_status(error):
+    args = getattr(error, "args", None) or ()
+    if args and isinstance(args[0], dict):
+        return args[0].get("status"), args[0].get("name")
+    return None, None
+
+
+def save_submission(client, sub, output_dir, make_odt=True):
+    """Write one submission's forum as Markdown (and ODT); returns ``(path, note)``.
+
+    Unlike the single-URL download this replaces the files of an earlier run
+    instead of adding ``_1`` copies, and includes every readable note.
+    """
+    notes = sub.notes
+    if notes is None:
+        fetched = client.get_notes(forum=sub.forum, limit=1000)
+        if len(fetched) >= 1000:  # a single page is 1000 notes at most
+            fetched = client.get_all_notes(forum=sub.forum)
+        notes = [note.__dict__ for note in fetched]
+    if not notes:
+        raise RuntimeError("nothing readable in this forum")
+
+    text = generate_markdown(notes, include_all=True)
+    md_path, odt_path = submission_paths(sub, output_dir)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = md_path.with_name(md_path.name + ".part")
+    partial.write_text(text + "\n", encoding="utf-8")
+    os.replace(partial, md_path)  # never leave a half-written file under the real name
+
+    note = ""
+    if len(notes) == 1:
+        note = "no replies yet"
+    if make_odt:
+        try:
+            markdown_to_odt(text, str(odt_path), quiet=True)
+        except Exception as e:  # a locked .odt, a pandoc hiccup: keep the Markdown
+            note = f"Markdown only, the ODT failed ({type(e).__name__}: {e})"
+
+    # A retitled paper would otherwise leave its old files next to the new ones.
+    # Done last, so a failed write never costs the copies of an earlier run.
+    forum = glob.escape(_slug(sub.forum))
+    for pattern in (f"*_{forum}.md", f"*_{forum}.odt"):
+        for stale in md_path.parent.glob(pattern):
+            if stale not in (md_path, odt_path):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+    return md_path, note
+
+
+def download_submissions(client, submissions, output_dir) -> int:
+    """Save every submission; one failure does not stop the rest. Returns an exit code."""
+    make_odt = True
+    try:
+        _ensure_pandoc()
+    except Exception as e:
+        make_odt = False
+        print(f"Pandoc is not available ({e}); writing Markdown files only.")
+
+    total = len(submissions)
+    saved, failed, consecutive = 0, [], 0
+    aborted = None
+    try:
+        for index, sub in enumerate(submissions, 1):
+            needs_request = sub.notes is None
+            if needs_request and index > 1:
+                time.sleep(BULK_PAUSE)
+            print(f"[{index}/{total}] {_describe(sub)}")
+            try:
+                path, note = save_submission(client, sub, output_dir, make_odt)
+            except Exception as e:  # openreview, requests, OS: record it and go on
+                reason = discover._reason(e)
+                failed.append((sub, reason))
+                consecutive += 1
+                print(f"    failed: {reason}")
+                status, name = _error_status(e)
+                if status == 401 or name in ("TokenExpiredError", "ChallengeRequiredError"):
+                    aborted = "OpenReview no longer accepts this session."
+                elif consecutive >= MAX_CONSECUTIVE_FAILURES:
+                    aborted = f"{consecutive} downloads in a row failed."
+                if aborted:
+                    break
+                continue
+            consecutive = 0
+            saved += 1
+            print(f"    {path}" + (f" ({note})" if note else ""))
+    except KeyboardInterrupt:
+        print(f"\nInterrupted after {saved} of {total}.")
+        raise
+
+    print(f"\nSaved {saved} of {total} submission(s) under {Path(output_dir)}{os.sep}")
+    if aborted:
+        print(f"Stopped early: {aborted} {total - saved - len(failed)} not attempted.")
+    if failed:
+        print("Failed:")
+        for sub, reason in failed:
+            print(f"  {_describe(sub)}: {reason}")
+    return 0 if saved == total else 1
+
+
+def bulk_command(args, passkey_port, mode) -> int:
+    """List what the user can reach, then download all of it or a selection.
+
+    ``mode`` is "all", "pick" (terminal selector) or "list" (print and exit).
+    """
+    roles = [
+        role.strip()
+        for value in (getattr(args, "role", None) or [])
+        for role in value.split(",")
+        if role.strip()
+    ]
+    output_dir = getattr(args, "output_dir", None) or "output"
+
+    if mode == "pick" and not picker.can_run_picker():
+        print("The selector needs an interactive terminal. Use --list to see your")
+        print("submissions, or --all to download all of them.")
+        return 1
+
+    client = resolve_client(args, passkey_port)
+    if client is None:
+        return 1
+
+    print("Looking up your submissions on OpenReview...")
+    try:
+        submissions, unresolved = discover.list_submissions(client)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        # Not handle_openreview_error: it offers to delete the cached login,
+        # which a failed listing does not call for.
+        print(f"Could not list your submissions: {discover._reason(e)}")
+        status, name = _error_status(e)
+        if status == 401 or name == "TokenExpiredError":
+            print(NEW_TOKEN_HINT)
+        return 1
+    if roles:
+        available = sorted(
+            {role for item in [*submissions, *unresolved] for role in item.roles}
+        )
+        submissions = filter_by_role(submissions, roles)
+        unresolved = [
+            item for item in unresolved
+            if {_role_key(r) for r in item.roles} & {_role_key(r) for r in roles}
+        ]
+        if not submissions:
+            print(f"No submissions with role {', '.join(roles)}.")
+            if available:
+                print(f"Your roles: {', '.join(available)}.")
+            _print_unresolved(unresolved)
+            return 1
+    if not submissions:
+        print("No submissions found for this account.")
+        _print_unresolved(unresolved)
+        return 1
+
+    if mode == "list":
+        print_listing(submissions, unresolved)
+        return 0
+
+    _print_unresolved(unresolved)
+    if mode == "pick":
+        try:
+            chosen = picker.pick(submissions)
+        except RuntimeError as e:
+            print(f"The selector could not run: {e}.")
+            print("Use --list to see your submissions, or --all to download all of them.")
+            return 1
+        if not chosen:
+            print("Nothing selected.")
+            return 0
+        submissions = chosen
+    return download_submissions(client, submissions, output_dir)
 
 
 def main():
@@ -1164,7 +1549,64 @@ def main():
             "port forward can be set up once."
         ),
     )
+    bulk = parser.add_argument_group(
+        "everything you have access to",
+        "Find the submissions you authored or hold a role on (reviewer, area "
+        "chair, ...) instead of asking for one URL. API v2 venues only.",
+    )
+    which = bulk.add_mutually_exclusive_group()
+    which.add_argument(
+        "--pick",
+        action="store_true",
+        help="Choose what to download in an interactive selector",
+    )
+    which.add_argument(
+        "--all",
+        action="store_true",
+        help="Download every submission you have access to",
+    )
+    which.add_argument(
+        "--list",
+        action="store_true",
+        help="Print the submissions you have access to and exit",
+    )
+    bulk.add_argument(
+        "--role",
+        action="append",
+        metavar="ROLE",
+        help=(
+            "With --pick/--all/--list: only submissions where you are ROLE, e.g. "
+            "author, reviewer, area-chair (repeat or separate with commas)"
+        ),
+    )
+    bulk.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help=(
+            "With --pick/--all: where to write the files (default: output). Each "
+            "venue gets a sub-directory; files from an earlier run are replaced."
+        ),
+    )
     args = parser.parse_args()
+    mode = "pick" if args.pick else "all" if args.all else "list" if args.list else None
+    if mode and (args.auth or args.wipe_credentials):
+        parser.error("--pick/--all/--list cannot be combined with --auth or --wipe-credentials")
+    if not mode and (args.role is not None or args.output_dir is not None):
+        parser.error("--role and --output-dir need --pick, --all or --list")
+    if args.role is not None and not any(
+        role.strip() for value in args.role for role in value.split(",")
+    ):
+        parser.error("--role needs a role, e.g. author, reviewer or area-chair")
+    if args.output_dir is not None and not args.output_dir.strip():
+        parser.error("--output-dir needs a directory")
+
+    # Titles contain any character; a console or pipe that cannot encode one
+    # (cp1252 on Windows, an ASCII locale) must not abort a batch.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
     if args.wipe_credentials:
         delete_credentials()
@@ -1183,6 +1625,8 @@ def main():
     try:
         if args.auth:
             return auth_command(args, passkey_port)
+        if mode:
+            return bulk_command(args, passkey_port, mode)
         return download_command(args, passkey_port)
     except openreview.openreview.OpenReviewException as e:
         return handle_openreview_error(e)
