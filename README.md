@@ -26,9 +26,6 @@ or later (uv fetches one by itself).
 | **Install with pip** | `pip install openreview-dl` | `pip install -U openreview-dl` |
 | **Latest from GitHub** | `uvx --from git+https://github.com/dwahdany/openreview-dl openreview-dl` | Whatever is on `main` |
 
-The selector and the `--pick`, `--all` and `--list` options are newer than release 0.4.0. Until
-the next release is on PyPI, use the *Latest from GitHub* line to get them.
-
 ODT files are written with [pandoc](https://pandoc.org). If it is not installed, the tool
 downloads a copy on first use. The Markdown file is written first, so it is there even when
 the ODT conversion fails.

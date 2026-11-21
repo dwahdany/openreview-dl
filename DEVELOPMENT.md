@@ -208,8 +208,7 @@ Releases go to PyPI through trusted publishing: `.github/workflows/publish.yml` 
    uvx openreview-dl@latest --help
    ```
 
-Versions follow [Semantic Versioning](https://semver.org/). After a release that makes the
-README's note about unreleased options untrue (see its Install section), remove that note.
+Versions follow [Semantic Versioning](https://semver.org/).
 
 The one-time PyPI setup, should it ever be needed again: under *Publishing* in the PyPI account
 settings, add a trusted publisher with owner `dwahdany`, repository `openreview-dl`, workflow
