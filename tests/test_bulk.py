@@ -143,59 +143,51 @@ class _Client:
 
 
 @pytest.fixture
-def no_pandoc(monkeypatch):
-    """Record ODT conversions instead of running pandoc; never sleep."""
-    made = []
-    monkeypatch.setattr(cli, "_ensure_pandoc", lambda: None)
-    monkeypatch.setattr(
-        cli, "markdown_to_odt",
-        lambda text, path, quiet=False: (made.append(path), open(path, "w").close()),
-    )
+def no_sleep(monkeypatch):
+    """Skip the pause between downloads."""
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
-    return made
 
 
 class TestSubmissionPaths:
     def test_readable_and_safe(self, tmp_path):
         sub = _sub(forum="aB3-_x", number=42, title="Is it: safe? / yes\\no <ok>")
-        md, odt = cli.submission_paths(sub, tmp_path)
+        md = cli.submission_paths(sub, tmp_path)
         assert md == tmp_path / "Conf.cc-2026-Conference" / "42_Is-it-safe-yes-no-ok_aB3-_x.md"
-        assert odt.suffix == ".odt" and odt.with_suffix(".md") == md
 
     def test_title_without_ascii_and_no_number(self, tmp_path):
-        md, _ = cli.submission_paths(_sub(forum="f", number=None, title="机器学习", venue=""), tmp_path)
+        md = cli.submission_paths(_sub(forum="f", number=None, title="机器学习", venue=""), tmp_path)
         assert md == tmp_path / "unknown-venue" / "f.md"
 
     def test_long_title_is_capped(self, tmp_path):
-        md, _ = cli.submission_paths(_sub(title="word " * 50), tmp_path)
+        md = cli.submission_paths(_sub(title="word " * 50), tmp_path)
         assert len(md.name) < 80
 
 
 class TestDownloadSubmissions:
-    def test_writes_markdown_and_odt_without_requests(self, tmp_path, no_pandoc, capsys):
+    def test_writes_markdown_without_requests(self, tmp_path, no_sleep, capsys):
         client = _Client()
         code = cli.download_submissions(client, [_sub("f1", 1), _sub("f2", 2, role="Reviewer")], tmp_path)
         assert code == 0 and client.calls == []
         files = sorted(p.name for p in (tmp_path / "Conf.cc-2026-Conference").iterdir())
-        assert files == ["1_A-title_f1.md", "1_A-title_f1.odt", "2_A-title_f2.md", "2_A-title_f2.odt"]
+        assert files == ["1_A-title_f1.md", "2_A-title_f2.md"]
         text = (tmp_path / "Conf.cc-2026-Conference" / "2_A-title_f2.md").read_text(encoding="utf-8")
         assert "## Program Chairs" in text  # reviewers get the decision too
         out = capsys.readouterr().out
         assert "[2/2] Reviewer" in out and "Saved 2 of 2" in out
 
-    def test_rerun_replaces_files_and_drops_the_old_title(self, tmp_path, no_pandoc):
+    def test_rerun_replaces_files_and_drops_the_old_title(self, tmp_path, no_sleep):
         cli.download_submissions(_Client(), [_sub(title="Old title")], tmp_path)
         cli.download_submissions(_Client(), [_sub(title="New title")], tmp_path)
         cli.download_submissions(_Client(), [_sub(title="New title")], tmp_path)
         files = sorted(p.name for p in (tmp_path / "Conf.cc-2026-Conference").iterdir())
-        assert files == ["1_New-title_f1.md", "1_New-title_f1.odt"]
+        assert files == ["1_New-title_f1.md"]
 
-    def test_forum_is_fetched_when_replies_were_not_listed(self, tmp_path, no_pandoc):
+    def test_forum_is_fetched_when_replies_were_not_listed(self, tmp_path, no_sleep):
         client = _Client(forums={"f1": _forum("f1")})
         assert cli.download_submissions(client, [_sub(notes=None)], tmp_path) == 0
         assert client.calls == ["f1"]
 
-    def test_one_failure_does_not_stop_the_batch(self, tmp_path, no_pandoc, capsys, monkeypatch):
+    def test_one_failure_does_not_stop_the_batch(self, tmp_path, no_sleep, capsys, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("prompted during a batch"))
         forbidden = Exception({"name": "ForbiddenError", "message": "no access", "status": 403})
         client = _Client(forums={"f3": _forum("f3")}, errors={"f1": forbidden})
@@ -205,40 +197,21 @@ class TestDownloadSubmissions:
         assert "Saved 1 of 3" in out
         assert "ForbiddenError: no access" in out and "nothing readable" in out
 
-    def test_stops_after_repeated_failures(self, tmp_path, no_pandoc, capsys):
+    def test_stops_after_repeated_failures(self, tmp_path, no_sleep, capsys):
         client = _Client(errors={f"f{i}": RuntimeError("down") for i in range(10)})
         subs = [_sub(f"f{i}", i, notes=None) for i in range(10)]
         assert cli.download_submissions(client, subs, tmp_path) == 1
         assert client.calls == ["f0", "f1", "f2"]
         assert "Stopped early" in capsys.readouterr().out
 
-    def test_rejected_session_stops_at_once(self, tmp_path, no_pandoc, capsys):
+    def test_rejected_session_stops_at_once(self, tmp_path, no_sleep, capsys):
         expired = Exception({"name": "TokenExpiredError", "message": "expired", "status": 401})
         client = _Client(errors={"f0": expired})
         subs = [_sub(f"f{i}", i, notes=None) for i in range(4)]
         assert cli.download_submissions(client, subs, tmp_path) == 1
         assert client.calls == ["f0"]
 
-    def test_odt_failure_keeps_the_markdown(self, tmp_path, monkeypatch, capsys):
-        def locked(text, path, quiet=False):
-            raise PermissionError("in use")
-
-        monkeypatch.setattr(cli, "_ensure_pandoc", lambda: None)
-        monkeypatch.setattr(cli, "markdown_to_odt", locked)
-        assert cli.download_submissions(_Client(), [_sub()], tmp_path) == 0
-        assert (tmp_path / "Conf.cc-2026-Conference" / "1_A-title_f1.md").exists()
-        assert "Markdown only" in capsys.readouterr().out
-
-    def test_without_pandoc_only_markdown_is_written(self, tmp_path, monkeypatch, capsys):
-        def missing():
-            raise OSError("no pandoc")
-
-        monkeypatch.setattr(cli, "_ensure_pandoc", missing)
-        monkeypatch.setattr(cli, "markdown_to_odt", lambda *a, **k: pytest.fail("converted"))
-        assert cli.download_submissions(_Client(), [_sub()], tmp_path) == 0
-        assert "Markdown files only" in capsys.readouterr().out
-
-    def test_ctrl_c_is_passed_on(self, tmp_path, no_pandoc, capsys):
+    def test_ctrl_c_is_passed_on(self, tmp_path, no_sleep, capsys):
         client = _Client(errors={"f1": KeyboardInterrupt()})
         with pytest.raises(KeyboardInterrupt):
             cli.download_submissions(client, [_sub(notes=None)], tmp_path)
@@ -265,7 +238,7 @@ class TestFilterByRole:
 
 class TestBulkCommand:
     @pytest.fixture
-    def listed(self, monkeypatch, tmp_path, no_pandoc):
+    def listed(self, monkeypatch, tmp_path, no_sleep):
         """Logged in, with two submissions and one unreadable paper on the account."""
         subs = [_sub("f1", 1, title="Mine"), _sub("f2", 2, title="Reviewed", role="Reviewer")]
         unresolved = [Unresolved(V, 77, ["Author"])]
@@ -408,7 +381,7 @@ class TestReviewFixes:
         out = capsys.readouterr().out
         assert "\x1b" not in out and "\x07" not in out and "‮" not in out
 
-    def test_failed_write_keeps_the_files_of_an_earlier_run(self, tmp_path, no_pandoc, monkeypatch):
+    def test_failed_write_keeps_the_file_of_an_earlier_run(self, tmp_path, no_sleep, monkeypatch):
         cli.download_submissions(_Client(), [_sub(title="Old title")], tmp_path)
 
         def full(*args, **kwargs):
@@ -417,7 +390,7 @@ class TestReviewFixes:
         monkeypatch.setattr(cli.os, "replace", full)
         assert cli.download_submissions(_Client(), [_sub(title="New title")], tmp_path) == 1
         names = {p.name for p in (tmp_path / "Conf.cc-2026-Conference").iterdir()}
-        assert {"1_Old-title_f1.md", "1_Old-title_f1.odt"} <= names
+        assert "1_Old-title_f1.md" in names
 
     def _main(self, monkeypatch, *argv):
         monkeypatch.setattr(sys, "argv", ["openreview-dl", *argv])
@@ -456,7 +429,7 @@ class TestReviewFixes:
         assert self._main(monkeypatch, "--pick") == 1
         assert "could not run: it crashed" in capsys.readouterr().out
 
-    def test_output_that_the_console_cannot_encode_does_not_abort(self, monkeypatch, tmp_path, no_pandoc):
+    def test_output_that_the_console_cannot_encode_does_not_abort(self, monkeypatch, tmp_path, no_sleep):
         import io
 
         monkeypatch.setattr(cli, "resolve_client", lambda args, port: _Client())

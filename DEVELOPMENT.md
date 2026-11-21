@@ -93,13 +93,10 @@ appears only after it has been pushed to `main`.
 
 | File | Contents |
 |---|---|
-| `src/openreview_dl/cli.py` | Argument parsing, login (password, two-factor, passkey, tokens), the credential cache, Markdown and ODT rendering, the single-URL download and the `--pick` / `--all` / `--list` commands |
+| `src/openreview_dl/cli.py` | Argument parsing, login (password, two-factor, passkey, tokens), the credential cache, Markdown rendering, the single-URL download and the `--pick` / `--all` / `--list` commands |
 | `src/openreview_dl/discover.py` | Finds every submission the logged-in account can reach |
 | `src/openreview_dl/picker.py` | The terminal selector (Textual) |
 | `scripts/screenshots.py` | Regenerates the README pictures |
-
-`get_reviews.py` and `env.yml` in the repository root are the original script and its conda
-environment from before the project was packaged; nothing uses them.
 
 Rendering has two modes. The single-URL download calls `generate_markdown(notes)` and writes
 only the reviewers' threads. The bulk commands call `generate_markdown(notes, include_all=True)`,

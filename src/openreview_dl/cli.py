@@ -21,30 +21,12 @@ from operator import itemgetter
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-import markdown
 import openreview
-import pypandoc
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from . import discover, picker
-
-_pandoc_checked = False
-
-
-def _ensure_pandoc():
-    """Ensure pandoc is available, downloading if necessary."""
-    global _pandoc_checked
-    if _pandoc_checked:
-        return
-    try:
-        pypandoc.get_pandoc_version()
-    except OSError:
-        print("Pandoc not found. Downloading...")
-        pypandoc.download_pandoc()
-    _pandoc_checked = True
-
 
 def get_config_dir() -> Path:
     """Get the config directory path, creating it if it doesn't exist."""
@@ -1040,17 +1022,6 @@ def process_note(note, is_rebuttal=False, depth=0, detailed=False):
     return markdown_text
 
 
-def markdown_to_odt(markdown_text, output_filename, quiet=False):
-    _ensure_pandoc()
-    # Convert markdown to HTML
-    html = markdown.markdown(markdown_text)
-
-    # Convert HTML to ODT
-    pypandoc.convert_text(html, "odt", format="html", outputfile=output_filename)
-    if not quiet:
-        print(f"ODT file created: {output_filename}")
-
-
 def ensure_output_dir(output_dir: str) -> Path:
     """Create output directory if it doesn't exist and return Path object."""
     output_path = Path(output_dir)
@@ -1183,7 +1154,7 @@ def resolve_client(args, passkey_port):
 
 
 def download_command(args, passkey_port) -> int:
-    """Prompt for a forum URL, log in, and write the Markdown and ODT files."""
+    """Prompt for a forum URL, log in, and write the Markdown file."""
     can_pick = picker.can_run_picker()
     hint = " (or press Enter to pick from your submissions)" if can_pick else ""
     url = input(f"Enter the OpenReview URL{hint}: ")
@@ -1215,11 +1186,6 @@ def download_command(args, passkey_port) -> int:
     with open(markdown_filename, "w", encoding="utf-8") as md_file:
         md_file.write(markdown_output)
     print(f"Markdown file created: {markdown_filename}")
-
-    # Save ODT file
-    odt_filename = output_dir / f"{forum_id}.odt"
-    odt_filename = get_unique_filename(str(odt_filename))
-    markdown_to_odt(markdown_output, str(odt_filename))
     return 0
 
 
@@ -1278,7 +1244,7 @@ def _slug(text, limit=None) -> str:
 
 
 def submission_paths(sub, output_dir):
-    """``(markdown path, odt path)``: <out>/<venue>/<number>_<title>_<forum id>.*"""
+    """Where a submission is saved: <out>/<venue>/<number>_<title>_<forum id>.md"""
     directory = Path(output_dir) / (_slug(sub.venue_id) or "unknown-venue")
     parts = [
         str(sub.number) if sub.number is not None else "",
@@ -1286,7 +1252,7 @@ def submission_paths(sub, output_dir):
         _slug(sub.forum) or "forum",
     ]
     base = "_".join(part for part in parts if part)
-    return directory / f"{base}.md", directory / f"{base}.odt"
+    return directory / f"{base}.md"
 
 
 def _describe(sub) -> str:
@@ -1331,10 +1297,10 @@ def _error_status(error):
     return None, None
 
 
-def save_submission(client, sub, output_dir, make_odt=True):
-    """Write one submission's forum as Markdown (and ODT); returns ``(path, note)``.
+def save_submission(client, sub, output_dir):
+    """Write one submission's forum as Markdown; returns ``(path, note)``.
 
-    Unlike the single-URL download this replaces the files of an earlier run
+    Unlike the single-URL download this replaces the file of an earlier run
     instead of adding ``_1`` copies, and includes every readable note.
     """
     notes = sub.notes
@@ -1347,43 +1313,28 @@ def save_submission(client, sub, output_dir, make_odt=True):
         raise RuntimeError("nothing readable in this forum")
 
     text = generate_markdown(notes, include_all=True)
-    md_path, odt_path = submission_paths(sub, output_dir)
+    md_path = submission_paths(sub, output_dir)
     md_path.parent.mkdir(parents=True, exist_ok=True)
     partial = md_path.with_name(md_path.name + ".part")
     partial.write_text(text + "\n", encoding="utf-8")
     os.replace(partial, md_path)  # never leave a half-written file under the real name
 
-    note = ""
-    if len(notes) == 1:
-        note = "no replies yet"
-    if make_odt:
-        try:
-            markdown_to_odt(text, str(odt_path), quiet=True)
-        except Exception as e:  # a locked .odt, a pandoc hiccup: keep the Markdown
-            note = f"Markdown only, the ODT failed ({type(e).__name__}: {e})"
+    note = "no replies yet" if len(notes) == 1 else ""
 
-    # A retitled paper would otherwise leave its old files next to the new ones.
-    # Done last, so a failed write never costs the copies of an earlier run.
+    # A retitled paper would otherwise leave its old file next to the new one.
+    # Done last, so a failed write never costs the copy of an earlier run.
     forum = glob.escape(_slug(sub.forum))
-    for pattern in (f"*_{forum}.md", f"*_{forum}.odt"):
-        for stale in md_path.parent.glob(pattern):
-            if stale not in (md_path, odt_path):
-                try:
-                    stale.unlink()
-                except OSError:
-                    pass
+    for stale in md_path.parent.glob(f"*_{forum}.md"):
+        if stale != md_path:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     return md_path, note
 
 
 def download_submissions(client, submissions, output_dir) -> int:
     """Save every submission; one failure does not stop the rest. Returns an exit code."""
-    make_odt = True
-    try:
-        _ensure_pandoc()
-    except Exception as e:
-        make_odt = False
-        print(f"Pandoc is not available ({e}); writing Markdown files only.")
-
     total = len(submissions)
     saved, failed, consecutive = 0, [], 0
     aborted = None
@@ -1394,7 +1345,7 @@ def download_submissions(client, submissions, output_dir) -> int:
                 time.sleep(BULK_PAUSE)
             print(f"[{index}/{total}] {_describe(sub)}")
             try:
-                path, note = save_submission(client, sub, output_dir, make_odt)
+                path, note = save_submission(client, sub, output_dir)
             except Exception as e:  # openreview, requests, OS: record it and go on
                 reason = discover._reason(e)
                 failed.append((sub, reason))
