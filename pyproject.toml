@@ -1,7 +1,7 @@
 [project]
 name = "openreview-dl"
-version = "0.4.0"
-description = "Download OpenReview paper reviews and rebuttals as formatted documents"
+version = "0.5.0"
+description = "Download OpenReview paper reviews and rebuttals as Markdown documents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "BSD-3-Clause"}
@@ -22,9 +22,7 @@ classifiers = [
 dependencies = [
     # cryptography >= 49 ships no x86_64 macOS wheels; keep the floor below that.
     "cryptography>=44.0.2",
-    "markdown>=3.8.1",
     "openreview-py>=2.0.0",
-    "pypandoc>=1.15",
     "textual>=6.0.0,<9",
     "urllib3>=2.7.0",
 ]

@@ -1,7 +1,7 @@
 # openreview-dl
 
 openreview-dl saves the discussion of an OpenReview submission (the reviews, the rebuttals and
-every reply in between) as one readable document, in Markdown and ODT. Paste a forum URL, or let
+every reply in between) as one readable Markdown document. Paste a forum URL, or let
 it find every submission you wrote, review or chair and tick the ones you want in a terminal
 selector.
 
@@ -26,13 +26,6 @@ or later (uv fetches one by itself).
 | **Install with pip** | `pip install openreview-dl` | `pip install -U openreview-dl` |
 | **Latest from GitHub** | `uvx --from git+https://github.com/dwahdany/openreview-dl openreview-dl` | Whatever is on `main` |
 
-The selector and the `--pick`, `--all` and `--list` options are newer than release 0.4.0. Until
-the next release is on PyPI, use the *Latest from GitHub* line to get them.
-
-ODT files are written with [pandoc](https://pandoc.org). If it is not installed, the tool
-downloads a copy on first use. The Markdown file is written first, so it is there even when
-the ODT conversion fails.
-
 To work on the code, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Use
@@ -44,14 +37,11 @@ openreview-dl
 ```
 
 Paste the URL of the forum page (`https://openreview.net/forum?id=...`, copied from your author
-or reviewer console) and log in when asked. You get two files:
+or reviewer console) and log in when asked. The document is written to `output/<forum id>.md`.
 
-- `output/<forum id>.md`: the Markdown document
-- `output/<forum id>.odt`: the same for LibreOffice, Word or Pages
-
-The document starts with the paper's title and abstract, then has one section per reviewer: the
+It starts with the paper's title and abstract, then has one section per reviewer: the
 review, followed by the replies to it in thread order. It is also printed to the terminal.
-Downloading the same forum again keeps the earlier files and adds `_1`, `_2`, ... copies.
+Downloading the same forum again keeps the earlier file and adds a `_1`, `_2`, ... copy.
 
 ### Everything you have access to
 
@@ -88,7 +78,7 @@ Two options narrow and redirect the download:
   `--all --role reviewer` or `--pick --role author,area-chair`.
 - `--output-dir DIR` changes where the files go (default `output`).
 
-Files are written to `DIR/<venue>/<number>_<title>_<forum id>.md` and `.odt`. Running the
+Files are written to `DIR/<venue>/<number>_<title>_<forum id>.md`. Running the
 command again replaces the files of the earlier run, so the directory always holds the current
 state of each discussion. These documents contain every note you can read: reviews with their
 threads first, then meta-reviews, decisions and other comments.
@@ -171,8 +161,6 @@ is only used after OpenReview confirms it belongs to your account.
 - **Request limits.** OpenReview allows an account a few hundred requests per hour. Listing
   costs a few requests per venue, so ordinary accounts are far below that; if the limit
   is reached anyway, the tool stops with a message instead of saving an incomplete set.
-- **Review text with its own markup.** A review that contains Markdown headings or unclosed HTML
-  tags can disturb the layout of the ODT file. The Markdown file is unaffected.
 - **Windows.** The tests run on Windows, but the selector has not been tried by hand there.
 
 ## License
